@@ -6,11 +6,15 @@
 
 // Project specific
 #include <pcap.h>
-#include <net/ethernet.h> // contains definition for ethhdr
-#include <arpa/inet.h> // for inet_ntoa()
-#include <netinet/ip_icmp.h>   //Provides declarations for icmp header
-#include <netinet/tcp.h>   //Provides declarations for tcp header
+#include <net/ethernet.h> // ethhdr
+#include <arpa/inet.h> // inet_ntoa()
+#include <netinet/ip_icmp.h>   //ip header
+#include <netinet/tcp.h>   //tcp header
+
 const int DEFAULT_ERROR_BUF_SIZE = 1024;
+const int MAC_ADDR_OCTETS = 6;
+#define NO_FLAGS        (!(TH_FIN|TH_SYN|TH_RST|TH_ACK|TH_URG|TH_ECE|TH_CWR))
+
 enum PROTOCOL
 {
     ICMP = 1,
@@ -25,7 +29,7 @@ process_ethernet_packet( const u_char* packet )
 {
     struct ethhdr *ethernetHeader = (struct ethhdr *)packet;
 
-    for(int i = 0; i<=5; i++)
+    for(int i = 0; i < MAC_ADDR_OCTETS; i++)
         std::cout << std::hex
                   << std::setfill('0')
                   << std::setw(2)
@@ -34,13 +38,14 @@ process_ethernet_packet( const u_char* packet )
 
     std::cout << " ";
 
-    for(int i = 0; i <=5; i++) {
+    for(int i = 0; i < MAC_ADDR_OCTETS; i++) {
         std::cout << std::hex
                   << std::setfill('0')
                   << std::setw(2)
                   << static_cast<int>(ethernetHeader->h_source[i])
                   << (i == 5 ? "" : ":");
     }
+
     std::cout << " 0x"
               << std::hex
               << std::setfill('0')
@@ -59,19 +64,18 @@ process_ip_packet( const u_char* packet )
     // IP Header = packet + offset, where offset = length(ethernet header)
     struct iphdr *iph = (struct iphdr *)(packet + sizeof(struct ethhdr) );
 
-    //
+    // nullify and place the source IP addr
     memset( &source, 0, sizeof(source) );
     source.sin_addr.s_addr = iph->saddr;
 
-    //
+    // nullify and placethe dest IP addr
     memset( &destination, 0, sizeof(destination) );
     destination.sin_addr.s_addr = iph->daddr;
 
-    // The inet_ntoa(addr) function converts the Internet host address addr,
+      // The inet_ntoa(addr) function converts the Internet host address addr,
     // given in network byte order, to a string in IPv4 dotted-decimal notation.
-    std::cout
-            << inet_ntoa( source.sin_addr )
-            << " " << inet_ntoa( destination.sin_addr );
+    std::cout << inet_ntoa( source.sin_addr );
+    std::cout << " " << inet_ntoa( destination.sin_addr );
 }
 
 // Prints the protocol number, source and dest ports
@@ -108,18 +112,40 @@ packet_xmas_or_null( const u_char* packet,
     // TCP Header = packet + offset, where offset = length(eth) + length(iph)
     struct tcphdr *tcph = (struct tcphdr*)(packet + IPHeaderSize + sizeof(struct ethhdr));
 
-    if( tcph->th_flags == 0 )
+    // As the flags are 1 byte there is no endianess to check
+    if( static_cast<uint8_t >(0) == tcph->th_flags )
     {
         type = "Null";
         return true;
     }
-    else if( tcph->th_flags == (TH_FIN + TH_PUSH + TH_URG) )
+    else if( (TH_FIN + TH_PUSH + TH_URG) == tcph->th_flags )
     {
         type = "Xmas";
         return true;
     }
 
     return false;
+}
+
+bool
+correct_tcp_checksum( const u_char* packet )
+{
+    // TODO: Check TCP checksum
+    //IP header skipping the ethernet header
+    struct iphdr *iph = (struct iphdr*)(packet + sizeof(struct ethhdr));
+
+    // Ethernet header size is fixed, but IP header size is not
+    size_t IPHeaderSize = iph->ihl*4;
+
+    // TCP Header = packet + offset, where offset = length(eth) + length(iph)
+    struct tcphdr *tcph = (struct tcphdr*)(packet + IPHeaderSize + sizeof(struct ethhdr));
+
+    u_int16_t chksm = ntohs(tcph->check);
+
+    // TODO: Calculate the real checksum
+    u_int16_t real_chksm = chksm;
+
+    return ( real_chksm == chksm );
 }
 
 
@@ -129,6 +155,10 @@ void
 print_tcp_packet( const u_char* packet,
                         int headerSize )
 {
+    // If the TCP checksum is not valid just bail
+    if( !correct_tcp_checksum(packet) )
+        return;
+
     // If the TCP packet is not null or xmas return
     // otherwise proceed with processing and printing it
     std::string type;
@@ -142,6 +172,42 @@ print_tcp_packet( const u_char* packet,
     std::cout << " " << type << std::endl;
 }
 
+bool
+correct_ip_checksum( struct iphdr* iph )
+{
+    u_int16_t chksm;
+    chksm = ntohs(iph->check );
+    size_t IPHeaderSize = iph->ihl*4;
+
+
+    u_int16_t real_chksm = chksm;
+
+    u_int16_t checksum = chksm;
+    // Source : https://tools.ietf.org/html/rfc1071
+    // TODO: Make it work work work
+
+    /*
+    register long sum = 0;
+    int count = (int)IPHeaderSize;
+    unsigned short* addr = (unsigned short*)iph;
+    while( count > 1 )  {
+        sum += *addr++;
+        count -= 2;
+    }
+
+    if( count > 0 )
+        sum += * (unsigned char *) addr;
+
+
+    while (sum>>16)
+        sum = (sum & 0xffff) + (sum >> 16);
+
+    checksum = ~sum;
+
+    */
+    return checksum == chksm;
+}
+
 // Custom callback function called for processing every packet
 void
 handler(    u_char *userData, // not used
@@ -150,6 +216,12 @@ handler(    u_char *userData, // not used
 {
     //IP header skipping the ethernet header
     struct iphdr *iph = (struct iphdr*)(packet + sizeof(struct ethhdr));
+
+    // If the IP checksum is not correct just bail.
+    // In this case we cannot even tell if the packet over it is TCP, UDP, etc.
+    // Because the data is corrupted
+    if( !correct_ip_checksum(iph))
+        return;
 
     // Implement via switch so it can be further improved for other protocols, too
     switch( iph->protocol ) {
